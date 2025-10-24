@@ -1,0 +1,17 @@
+# Version Discovery Configuration
+# Controls which versions are automatically discovered and built
+
+# Global settings
+max_major_versions: 3  # Keep only the last N major versions
+
+# Elasticsearch-specific settings
+elasticsearch_min_major_version: 7  # Minimum major version to build (e.g., 7 = ignore v5, v6)
+
+# OpenSearch-specific settings
+opensearch_min_major_version: 1  # Minimum major version to build
+
+# Notes:
+# - The discovery script finds all stable releases (x.y.z format only)
+# - Pre-releases (alpha, beta, rc, snapshot) are automatically excluded
+# - For each major.minor version, only the latest patch is built
+# - Versions are sorted and filtered based on the settings above

@@ -1,6 +1,25 @@
 name: Docker Image Elasticsearch
 on:
   workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: true
+        type: choice
+        options:
+          - latest-only
+          - full
+          - custom
+        default: latest-only
+      custom_versions:
+        description: 'Custom versions (comma-separated, e.g., 8.11,8.12)'
+        required: false
+        type: string
+      force_rebuild:
+        description: 'Force rebuild even if images exist'
+        required: false
+        type: boolean
+        default: false
   schedule:
     - cron: "0 6 * * *" # 6 AM Daily
   push:
@@ -8,75 +27,244 @@ on:
       - .trigger
       - elasticsearch/**
       - .github/workflows/*elasticsearch*
+    branches:
+      - master
+
+env:
+  GHCR_REGISTRY: ghcr.io
+  TARGET_REGISTRY: ghcr.io/${{ github.repository_owner }}/elasticsearch
+  DOCKERHUB_REGISTRY: disrex/elasticsearch
 
 jobs:
-  elasticsearch:
-    name: Elasticsearch
+  discover:
+    name: Discover Versions
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.check-images.outputs.build_matrix }}
+      build_needed: ${{ steps.matrix.outputs.build_needed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup crane
+        uses: imjasonh/setup-crane@v0.4
+
+      - name: Determine build type
+        id: build_type
+        run: |
+          BUILD_TYPE="latest-only"
+
+          # Workflow dispatch with custom settings
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            BUILD_TYPE="${{ inputs.build_type }}"
+          # Push to master or scheduled
+          elif [[ "${{ github.ref }}" == "refs/heads/master" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
+            BUILD_TYPE="latest-only"
+          # Pull request
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BUILD_TYPE="latest-only"
+          fi
+
+          echo "build_type=$BUILD_TYPE" >> $GITHUB_OUTPUT
+          echo "📦 Build type: $BUILD_TYPE"
+
+      - name: Generate version matrix
+        id: matrix
+        run: |
+          BUILD_TYPE="${{ steps.build_type.outputs.build_type }}"
+          VERSIONS=""
+
+          # Load configuration
+          MAX_MAJOR_VERSIONS=$(grep 'max_major_versions:' .github/version-config.yml | awk '{print $2}')
+          MIN_MAJOR_VERSION=$(grep 'elasticsearch_min_major_version:' .github/version-config.yml | awk '{print $2}')
+
+          echo "📋 Configuration: max_major_versions=$MAX_MAJOR_VERSIONS, min_major_version=$MIN_MAJOR_VERSION"
+
+          # Handle custom versions from workflow dispatch
+          if [[ "$BUILD_TYPE" == "custom" ]] && [[ -n "${{ inputs.custom_versions }}" ]]; then
+            VERSIONS="${{ inputs.custom_versions }}"
+            echo "🎯 Using custom versions: $VERSIONS"
+          else
+            # Discover versions from upstream registry
+            echo "🔍 Discovering Elasticsearch versions from docker.elastic.co/elasticsearch/elasticsearch..."
+            RAW_TAGS=$(crane ls docker.elastic.co/elasticsearch/elasticsearch 2>/dev/null || echo "")
+
+            if [[ -z "$RAW_TAGS" ]]; then
+              echo "❌ Failed to list tags from registry"
+              echo "build_needed=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            echo "Found $(echo "$RAW_TAGS" | wc -l) total tags"
+
+            # Filter to stable versions only (x.y.z format)
+            STABLE_VERSIONS=$(echo "$RAW_TAGS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -Vr || true)
+
+            if [[ -z "$STABLE_VERSIONS" ]]; then
+              echo "❌ No stable versions found"
+              echo "build_needed=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            # Group by major.minor and keep only latest patch
+            declare -A LATEST_VERSIONS
+            declare -A MAJOR_COUNT
+
+            while IFS= read -r version; do
+              [[ -z "$version" ]] && continue
+
+              MAJOR=$(echo "$version" | cut -d. -f1)
+              MINOR=$(echo "$version" | cut -d. -f2)
+              MAJOR_MINOR="${MAJOR}.${MINOR}"
+
+              # Skip if below minimum major version
+              if [[ -n "$MIN_MAJOR_VERSION" ]] && [[ "$MAJOR" -lt "$MIN_MAJOR_VERSION" ]]; then
+                continue
+              fi
+
+              # Track major version count
+              MAJOR_COUNT[$MAJOR]=1
+
+              # Keep only latest patch for each major.minor
+              if [[ -z "${LATEST_VERSIONS[$MAJOR_MINOR]:-}" ]]; then
+                LATEST_VERSIONS[$MAJOR_MINOR]="$version"
+              fi
+            done <<< "$STABLE_VERSIONS"
+
+            # Filter to recent major versions only
+            UNIQUE_MAJORS=($(echo "${!MAJOR_COUNT[@]}" | tr ' ' '\n' | sort -Vr))
+            if [[ ${#UNIQUE_MAJORS[@]} -gt $MAX_MAJOR_VERSIONS ]]; then
+              UNIQUE_MAJORS=("${UNIQUE_MAJORS[@]:0:$MAX_MAJOR_VERSIONS}")
+            fi
+
+            echo "📊 Found ${#UNIQUE_MAJORS[@]} major version(s): ${UNIQUE_MAJORS[*]}"
+
+            # Build version list based on build type
+            if [[ "$BUILD_TYPE" == "full" ]]; then
+              # All versions from recent majors
+              for major_minor in $(echo "${!LATEST_VERSIONS[@]}" | tr ' ' '\n' | sort -V); do
+                MAJOR=$(echo "$major_minor" | cut -d. -f1)
+                for allowed_major in "${UNIQUE_MAJORS[@]}"; do
+                  if [[ "$MAJOR" == "$allowed_major" ]]; then
+                    VERSIONS+="${LATEST_VERSIONS[$major_minor]},"
+                    break
+                  fi
+                done
+              done
+              VERSIONS="${VERSIONS%,}"
+            else
+              # latest-only: just the newest from each recent major
+              for major in "${UNIQUE_MAJORS[@]}"; do
+                # Find latest version for this major
+                LATEST_FOR_MAJOR=$(echo "${!LATEST_VERSIONS[@]}" | tr ' ' '\n' | grep "^${major}\." | sort -V | tail -1)
+                if [[ -n "$LATEST_FOR_MAJOR" ]]; then
+                  VERSIONS+="${LATEST_VERSIONS[$LATEST_FOR_MAJOR]},"
+                fi
+              done
+              VERSIONS="${VERSIONS%,}"
+            fi
+          fi
+
+          if [[ -z "$VERSIONS" ]]; then
+            echo "❌ No versions to build"
+            echo "build_needed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Generate matrix JSON
+          MATRIX='{"include":['
+          FIRST=true
+          for version in ${VERSIONS//,/ }; do
+            [[ -z "$version" ]] && continue
+            [[ "$FIRST" == true ]] && FIRST=false || MATRIX+=','
+            MATRIX+="{\"version\":\"$version\"}"
+          done
+          MATRIX+=']}'
+
+          echo "✅ Generated matrix with versions: $VERSIONS"
+          echo "version_matrix=$MATRIX" >> $GITHUB_OUTPUT
+          echo "build_needed=true" >> $GITHUB_OUTPUT
+
+      - name: Check existing images and prepare build matrix
+        id: check-images
+        if: steps.matrix.outputs.build_needed == 'true'
+        run: |
+          echo "📦 Checking for existing images..."
+          FORCE_REBUILD="${{ inputs.force_rebuild }}"
+          VERSION_MATRIX='${{ steps.matrix.outputs.version_matrix }}'
+
+          # Build matrix with only versions that need building
+          BUILD_MATRIX='{"include":['
+          FIRST=true
+
+          for item in $(echo "$VERSION_MATRIX" | jq -c '.include[]'); do
+            version=$(echo "$item" | jq -r '.version')
+            major_minor=$(echo "$version" | cut -d. -f1-2)
+
+            # Check if image exists
+            if [[ "$FORCE_REBUILD" != "true" ]] && crane manifest "${{ env.TARGET_REGISTRY }}:$major_minor" >/dev/null 2>&1; then
+              echo "✅ Image exists: $major_minor (skipping)"
+              continue
+            fi
+
+            # Add to build matrix
+            [[ "$FIRST" == true ]] && FIRST=false || BUILD_MATRIX+=','
+            BUILD_MATRIX+="{\"version\":\"$version\",\"major_minor\":\"$major_minor\"}"
+            echo "🔨 Will build: $version (tag as $major_minor)"
+          done
+
+          BUILD_MATRIX+=']}'
+          echo "build_matrix=$BUILD_MATRIX" >> $GITHUB_OUTPUT
+          echo "📋 Build matrix: $BUILD_MATRIX"
+
+  elasticsearch:
+    name: Elasticsearch ${{ matrix.major_minor }}
+    runs-on: ubuntu-latest
+    needs: discover
+    if: needs.discover.outputs.build_needed == 'true' && needs.discover.outputs.matrix != '{"include":[]}'
 
     strategy:
       fail-fast: false
-      matrix:
-        version:
-          - "5"
-          - "6"
-          - "7.6"
-          - "7.7"
-          - "7.9"
-          - "7.10"
-          - "7.12"
-          - "7.13"
-          - "7.14"
-          - "7.15"
-          - "7.16"
-          - "7.17"
-          - "8.0"
-          - "8.1"
-          - "8.2"
-          - "8.3"
-          - "8.4"
-          - "8.5"
-          - "8.6"
-          - "8.7"
-          - "8.8"
-          - "8.9"
-          - "8.10"
-          - "8.11"
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+
+    permissions:
+      packages: write
+      contents: read
 
     steps:
-      - uses: actions/checkout@v3
-      - uses: docker/setup-qemu-action@v2
-      - uses: docker/setup-buildx-action@v2
+      - name: Checkout
+        uses: actions/checkout@v3
 
-      - name: Login to Github Container Registry
-        uses: docker/login-action@v2
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.repository_owner }}
+          username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
         if: ${{ !env.ACT }}
 
       - name: Login to Docker Hub
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
         if: ${{ !env.ACT }}
 
-      - name: Set build-args
-        run: |-
-          ESCAPED_VERSION="$(echo ${{ matrix.version }} | sed 's/\./\\\./g')"
-          ES_VERSION=$(
-            docker run --rm gcr.io/go-containerregistry/crane:v0.8.0 ls docker.elastic.co/elasticsearch/elasticsearch \
-            | egrep "^${ESCAPED_VERSION}\.[0-9]+(\.[0-9]+)?\$" | sort -Vr | head -n1
-          )
-          echo "ES_VERSION=${ES_VERSION}" | tee /dev/stderr >> $GITHUB_ENV
-
-      - uses: docker/build-push-action@v4
+      - name: Build and push Elasticsearch image
+        uses: docker/build-push-action@v6
         with:
           context: elasticsearch
           platforms: linux/amd64,linux/arm64
-          build-args: ES_VERSION=${{ env.ES_VERSION }}
+          build-args: ES_VERSION=${{ matrix.version }}
           push: ${{ github.ref == 'refs/heads/master' && !env.ACT }}
-          tags: ghcr.io/${{ github.repository_owner }}/elasticsearch:${{ matrix.version }}, disrex/elasticsearch:${{ matrix.version }}
-        if: ${{ !env.ACT && github.ref == 'refs/heads/master'}}
+          tags: |
+            ${{ env.TARGET_REGISTRY }}:${{ matrix.major_minor }}
+            ${{ env.TARGET_REGISTRY }}:${{ matrix.version }}
+            ${{ env.DOCKERHUB_REGISTRY }}:${{ matrix.major_minor }}
+            ${{ env.DOCKERHUB_REGISTRY }}:${{ matrix.version }}
