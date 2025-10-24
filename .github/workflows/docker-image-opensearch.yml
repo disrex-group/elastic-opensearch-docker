@@ -82,8 +82,35 @@ jobs:
 
           # Handle custom versions from workflow dispatch
           if [[ "$BUILD_TYPE" == "custom" ]] && [[ -n "${{ inputs.custom_versions }}" ]]; then
-            VERSIONS="${{ inputs.custom_versions }}"
-            echo "🎯 Using custom versions: $VERSIONS"
+            echo "🎯 Processing custom versions: ${{ inputs.custom_versions }}"
+
+            # Get all available tags for version expansion
+            RAW_TAGS=$(crane ls docker.io/opensearchproject/opensearch 2>/dev/null || echo "")
+
+            # Expand custom versions to full versions
+            EXPANDED_VERSIONS=""
+            for custom_ver in $(echo "${{ inputs.custom_versions }}" | tr ',' ' '); do
+              # Check if this is already a full version (x.y.z)
+              if [[ "$custom_ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                # Already full version, use as-is
+                EXPANDED_VERSIONS+="${custom_ver},"
+                echo "  ✓ Using full version: $custom_ver"
+              else
+                # Partial version (e.g., 2.11), find latest patch
+                ESCAPED_VERSION="$(echo "$custom_ver" | sed 's/\./\\./g')"
+                LATEST_PATCH=$(echo "$RAW_TAGS" | grep -E "^${ESCAPED_VERSION}\.[0-9]+$" | sort -Vr | head -n1)
+
+                if [[ -n "$LATEST_PATCH" ]]; then
+                  EXPANDED_VERSIONS+="${LATEST_PATCH},"
+                  echo "  ✓ Expanded $custom_ver → $LATEST_PATCH"
+                else
+                  echo "  ⚠️  No match found for $custom_ver"
+                fi
+              fi
+            done
+
+            VERSIONS="${EXPANDED_VERSIONS%,}"
+            echo "📦 Resolved versions: $VERSIONS"
           else
             # Discover versions from upstream registry
             echo "🔍 Discovering OpenSearch versions from docker.io/opensearchproject/opensearch..."

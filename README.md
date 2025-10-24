@@ -105,8 +105,14 @@ You can manually trigger builds with custom options:
 2. Choose build type:
    - **latest-only**: Build only the newest version per major
    - **full**: Build all discovered versions
-   - **custom**: Specify exact versions (e.g., `8.11,8.10`)
-3. Enable **force_rebuild** to rebuild even if images exist
+   - **custom**: Specify versions (supports both formats)
+3. Specify custom versions (comma-separated):
+   - **Short format**: `2.11,2.10` - Auto-discovers latest patch (e.g., `2.11.0`)
+   - **Full format**: `2.11.0,2.10.5` - Uses exact version
+   - **Mixed**: `2.11,8.15.3` - Combines both formats
+4. Enable **force_rebuild** to rebuild even if images exist
+
+**Example**: Entering `2.11,8.15` will automatically resolve to `2.11.0,8.15.3` (or whatever the latest patches are)
 
 ## Available Images
 
